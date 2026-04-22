@@ -1,0 +1,3329 @@
+--- /dev/null
++++ b/middleware\ipguard\config.go
+@@ -0,0 +1,186 @@
++package ipguard
+
++
+
++import (
+
++	"fmt"
+
++	"net"
+
++
+
++	"github.com/gofiber/fiber/v3"
+
++)
+
++
+
++// Config defines the config for middleware.
+
++type Config struct {
+
++	// Next defines a function to skip this middleware when returned true.
+
++	//
+
++	// Optional. Default: nil
+
++	Next func(c fiber.Ctx) bool
+
++
+
++	// AllowedIPs is a list of IP addresses or CIDR ranges that are allowed to access.
+
++	// Supports both IPv4 and IPv6.
+
++	// Examples: "192.168.1.1", "10.0.0.0/24", "::1", "2001:db8::/32"
+
++	//
+
++	// Required. Default: []string{}
+
++	AllowedIPs []string
+
++
+
++	// ForbiddenHandler is called when the IP is not in the whitelist.
+
++	// By default, it returns a 403 Forbidden response.
+
++	//
+
++	// Optional. Default: func(c fiber.Ctx) error { return c.SendStatus(fiber.StatusForbidden) }
+
++	ForbiddenHandler fiber.Handler
+
++
+
++	// ExcludedPaths is a list of path prefixes that should be excluded from IP checking.
+
++	// Requests whose path starts with any of these prefixes will bypass the whitelist check.
+
++	// For exact path matching (e.g. "/health" should not match "/healthcheck"), use
+
++	// ExcludedExactPaths instead or append a trailing slash to the prefix (e.g. "/health/").
+
++	// Examples: "/health", "/public"
+
++	//
+
++	// Optional. Default: []string{}
+
++	ExcludedPaths []string
+
++
+
++	// ExcludedExactPaths is a list of exact paths that should be excluded from IP checking.
+
++	// Only requests whose path exactly matches one of these entries will bypass the whitelist check.
+
++	// Unlike ExcludedPaths, "/health" will NOT match "/healthcheck".
+
++	// Examples: "/health", "/public"
+
++	//
+
++	// Optional. Default: []string{}
+
++	ExcludedExactPaths []string
+
++
+
++	// IPExtractor is a function to extract the client IP from the request.
+
++	// When set, this function is used instead of the default IP extraction logic.
+
++	// This allows custom IP extraction for testing or special proxy setups.
+
++	//
+
++	// Optional. Default: nil (uses c.IP() or X-Forwarded-For based on UseXForwardedFor)
+
++	IPExtractor func(c fiber.Ctx) string
+
++
+
++	// UseXForwardedFor enables parsing of the X-Forwarded-For header to extract
+
++	// the client IP address. When enabled, the middleware will check the first
+
++	// IP address in the X-Forwarded-For header against the whitelist.
+
++	// Make sure your application is behind a trusted proxy before enabling this.
+
++	// This setting is ignored if IPExtractor is set.
+
++	//
+
++	// Optional. Default: false
+
++	UseXForwardedFor bool
+
++
+
++	// UseXRealIP enables parsing of the X-Real-IP header to extract
+
++	// the client IP address. When enabled, the middleware will use the value
+
++	// of the X-Real-IP header as the client IP if it contains a valid IP address.
+
++	// Make sure your application is behind a trusted proxy before enabling this.
+
++	// This setting is ignored if IPExtractor is set or UseXForwardedFor is enabled.
+
++	//
+
++	// Optional. Default: false
+
++	UseXRealIP bool
+
++
+
++	// NormalizeIPv4MappedIPv6 enables normalization of IPv4-mapped IPv6 addresses
+
++	// (e.g. "::ffff:192.168.1.1") to their plain IPv4 form (e.g. "192.168.1.1").
+
++	// This is useful when the server listens on an IPv6 socket and receives IPv4
+
++	// connections, which are represented as IPv4-mapped IPv6 addresses.
+
++	// When enabled (default), a client connecting from "::ffff:192.168.1.1" will match
+
++	// a whitelist entry of "192.168.1.1" or "192.168.1.0/24".
+
++	// Note: Go's net.ParseIP represents both "::ffff:1.2.3.4" and "1.2.3.4" identically
+
++	// as 16-byte IPv4-mapped IPv6 addresses internally, so disabling this option has
+
++	// limited practical effect — matching will still work via Go's built-in equivalence.
+
++	//
+
++	// Optional. Default: true
+
++	NormalizeIPv4MappedIPv6 *bool
+
++
+
++	// ContextKey is the key used to store the resolved client IP in c.Locals().
+
++	// The middleware will store the client IP string (after extraction and
+
++	// optional IPv4-mapped IPv6 normalization) in the Fiber context, making it
+
++	// available to downstream handlers via ClientIPFromContext(c) or c.Locals(key).
+
++	// This is useful when other handlers need access to the resolved client IP
+
++	// (e.g. for logging, rate limiting, audit trails) without re-parsing headers.
+
++	// Set DisableContextStorage to true to skip storing the client IP in the context.
+
++	//
+
++	// Optional. Default: "ipguard:clientIP"
+
++	ContextKey string
+
++
+
++	// DisableContextStorage disables storing the resolved client IP in the Fiber context.
+
++	// When true, the middleware will not call c.Locals() to store the IP, and
+
++	// ClientIPFromContext(c) will return an empty string for downstream handlers.
+
++	// This can be useful for minimal overhead when the context value is not needed.
+
++	//
+
++	// Optional. Default: false
+
++	DisableContextStorage bool
+
++}
+
++
+
++// defaultContextKey is the default key used to store the client IP in c.Locals().
+
++const defaultContextKey = "ipguard:clientIP"
+
++
+
++// ConfigDefault is the default config.
+
++var ConfigDefault = Config{
+
++	AllowedIPs: []string{},
+
++	ForbiddenHandler: func(c fiber.Ctx) error {
+
++		return c.SendStatus(fiber.StatusForbidden)
+
++	},
+
++	ExcludedPaths:           []string{},
+
++	ExcludedExactPaths:      []string{},
+
++	IPExtractor:             nil,
+
++	UseXForwardedFor:        false,
+
++	UseXRealIP:              false,
+
++	NormalizeIPv4MappedIPv6: boolPtr(true),
+
++	ContextKey:              defaultContextKey,
+
++	DisableContextStorage:   false,
+
++}
+
++
+
++// boolPtr returns a pointer to the given bool value.
+
++func boolPtr(b bool) *bool {
+
++	return &b
+
++}
+
++
+
++// Helper function to set default values.
+
++func configDefault(config ...Config) Config {
+
++	// Return default config if nothing provided
+
++	if len(config) < 1 {
+
++		return ConfigDefault
+
++	}
+
++
+
++	// Override default config
+
++	cfg := config[0]
+
++
+
++	// Set default values
+
++	if cfg.ForbiddenHandler == nil {
+
++		cfg.ForbiddenHandler = ConfigDefault.ForbiddenHandler
+
++	}
+
++
+
++	if cfg.AllowedIPs == nil {
+
++		cfg.AllowedIPs = ConfigDefault.AllowedIPs
+
++	}
+
++
+
++	if cfg.ExcludedPaths == nil {
+
++		cfg.ExcludedPaths = ConfigDefault.ExcludedPaths
+
++	}
+
++
+
++	if cfg.ExcludedExactPaths == nil {
+
++		cfg.ExcludedExactPaths = ConfigDefault.ExcludedExactPaths
+
++	}
+
++
+
++	if cfg.NormalizeIPv4MappedIPv6 == nil {
+
++		cfg.NormalizeIPv4MappedIPv6 = boolPtr(true)
+
++	}
+
++
+
++	return cfg
+
++}
+
++
+
++// parseAllowedIPs parses the allowed IPs list into separate single IPs and CIDR networks.
+
++func parseAllowedIPs(allowedIPs []string) ([]net.IP, []*net.IPNet, error) {
+
++	var ips []net.IP
+
++	var nets []*net.IPNet
+
++
+
++	for i, ipStr := range allowedIPs {
+
++		// Try parsing as CIDR first
+
++		if _, ipNet, err := net.ParseCIDR(ipStr); err == nil {
+
++			nets = append(nets, ipNet)
+
++			continue
+
++		}
+
++
+
++		// Try parsing as a single IP
+
++		if ip := net.ParseIP(ipStr); ip != nil {
+
++			ips = append(ips, ip)
+
++			continue
+
++		}
+
++
+
++		// Invalid entry — include index and value for clear diagnostics
+
++		return nil, nil, fmt.Errorf("allowedIPs[%d]: invalid IP/CIDR %q", i, ipStr)
+
++	}
+
++
+
++	return ips, nets, nil
+
++}
+
+
+--- /dev/null
++++ b/middleware\ipguard\ipguard.go
+@@ -0,0 +1,161 @@
++package ipguard
+
++
+
++import (
+
++	"net"
+
++	"strings"
+
++
+
++	"github.com/gofiber/fiber/v3"
+
++	"github.com/gofiber/utils/v2"
+
++)
+
++
+
++// New creates a new middleware handler that restricts access based on an IP whitelist.
+
++//
+
++// The middleware checks the client's IP address against a configured list of allowed IPs
+
++// and CIDR ranges. Both IPv4 and IPv6 are supported. Optionally, the X-Forwarded-For
+
++// or X-Real-IP header can be parsed to extract the client IP (use with caution behind
+
++// a trusted proxy). Specific path prefixes can be excluded from the check.
+
++func New(config ...Config) fiber.Handler {
+
++	// Set default config
+
++	cfg := configDefault(config...)
+
++
+
++	// Parse allowed IPs into lookup structures at initialization time
+
++	allowedIPs, allowedNets, err := parseAllowedIPs(cfg.AllowedIPs)
+
++	if err != nil {
+
++		panic("ipguard: " + err.Error())
+
++	}
+
++
+
++	// Return new handler
+
++	return func(c fiber.Ctx) error {
+
++		// Don't execute middleware if Next returns true
+
++		if cfg.Next != nil && cfg.Next(c) {
+
++			return c.Next()
+
++		}
+
++
+
++		// Check if the path is excluded from IP checking
+
++		path := c.Path()
+
++		for _, exactPath := range cfg.ExcludedExactPaths {
+
++			if path == exactPath {
+
++				return c.Next()
+
++			}
+
++		}
+
++		for _, prefix := range cfg.ExcludedPaths {
+
++			if strings.HasPrefix(path, prefix) {
+
++				return c.Next()
+
++			}
+
++		}
+
++
+
++		// Get the client IP address
+
++		clientIP := getClientIP(c, cfg.IPExtractor, cfg.UseXForwardedFor, cfg.UseXRealIP)
+
++		if clientIP == "" {
+
++			return cfg.ForbiddenHandler(c)
+
++		}
+
++
+
++		// Parse the client IP
+
++		ip := net.ParseIP(clientIP)
+
++		if ip == nil {
+
++			return cfg.ForbiddenHandler(c)
+
++		}
+
++
+
++		// Normalize IPv4-mapped IPv6 addresses if enabled
+
++		// e.g. ::ffff:192.168.1.1 → 192.168.1.1
+
++		// Go's net.ParseIP represents both "::ffff:1.2.3.4" and "1.2.3.4" as the same
+
++		// 16-byte IPv4-mapped IPv6 internally, so normalization converts them to the
+
++		// canonical 4-byte form for consistent comparisons with parseAllowedIPs results.
+
++		normalizeMapped := cfg.NormalizeIPv4MappedIPv6 != nil && *cfg.NormalizeIPv4MappedIPv6
+
++		if normalizeMapped {
+
++			if v4 := ip.To4(); v4 != nil {
+
++				ip = v4
+
++			}
+
++		}
+
++
+
++		// Store the resolved client IP in the context for downstream handlers.
+
++		// The IP is always stored under the default key ("ipguard:clientIP") so that
+
++		// ClientIPFromContext can reliably retrieve it regardless of configuration.
+
++		// If a custom ContextKey is configured and differs from the default, the IP
+
++		// is also stored under the custom key for direct c.Locals() access.
+
++		if !cfg.DisableContextStorage {
+
++			ipStr := ip.String()
+
++			c.Locals(defaultContextKey, ipStr)
+
++			if cfg.ContextKey != "" && cfg.ContextKey != defaultContextKey {
+
++				c.Locals(cfg.ContextKey, ipStr)
+
++			}
+
++		}
+
++
+
++		// Check if the IP is in the whitelist
+
++		if isIPAllowed(ip, allowedIPs, allowedNets) {
+
++			return c.Next()
+
++		}
+
++
+
++		// IP not in whitelist, invoke the forbidden handler
+
++		return cfg.ForbiddenHandler(c)
+
++	}
+
++}
+
++
+
++// getClientIP returns the client IP address using the configured extraction method.
+
++func getClientIP(c fiber.Ctx, ipExtractor func(fiber.Ctx) string, useXForwardedFor, useXRealIP bool) string {
+
++	// Use custom IP extractor if provided
+
++	if ipExtractor != nil {
+
++		return ipExtractor(c)
+
++	}
+
++
+
++	// Parse X-Forwarded-For header if enabled (takes priority over X-Real-IP)
+
++	if useXForwardedFor {
+
++		if xff := c.Get(fiber.HeaderXForwardedFor); xff != "" {
+
++			// X-Forwarded-For may contain multiple IPs: client, proxy1, proxy2, ...
+
++			// The first one is the original client IP. Validate each entry and
+
++			// return the first valid one to prevent spoofing with malformed values.
+
++			for _, entry := range strings.Split(xff, ",") {
+
++				ip := utils.Trim(entry, ' ')
+
++				if ip != "" && net.ParseIP(ip) != nil {
+
++					return ip
+
++				}
+
++			}
+
++		}
+
++	}
+
++
+
++	// Parse X-Real-IP header if enabled
+
++	if useXRealIP {
+
++		if xri := c.Get("X-Real-IP"); xri != "" {
+
++			ip := utils.Trim(xri, ' ')
+
++			if ip != "" && net.ParseIP(ip) != nil {
+
++				return ip
+
++			}
+
++		}
+
++	}
+
++
+
++	return c.IP()
+
++}
+
++
+
++// isIPAllowed checks whether the given IP is in the allowed IPs or CIDR ranges.
+
++func isIPAllowed(ip net.IP, allowedIPs []net.IP, allowedNets []*net.IPNet) bool {
+
++	// Check against single IPs
+
++	for _, allowedIP := range allowedIPs {
+
++		if allowedIP.Equal(ip) {
+
++			return true
+
++		}
+
++	}
+
++
+
++	// Check against CIDR ranges
+
++	for _, ipNet := range allowedNets {
+
++		if ipNet.Contains(ip) {
+
++			return true
+
++		}
+
++	}
+
++
+
++	return false
+
++}
+
++
+
++// ClientIPFromContext returns the client IP resolved by the ipguard middleware
+
++// from the Fiber context. This avoids re-parsing X-Forwarded-For, X-Real-IP, or
+
++// other headers in downstream handlers.
+
++//
+
++// The IP is always stored under the default key "ipguard:clientIP" regardless of
+
++// the ContextKey configuration, so this function works reliably even when a custom
+
++// ContextKey is set. To access the IP via a custom key, use c.Locals(key) directly.
+
++//
+
++// Returns an empty string if the middleware has not set the value or
+
++// DisableContextStorage is true.
+
++func ClientIPFromContext(c fiber.Ctx) string {
+
++	val, _ := c.Locals(defaultContextKey).(string)
+
++	return val
+
++}
+
+
+--- /dev/null
++++ b/middleware\ipguard\ipguard_test.go
+@@ -0,0 +1,1312 @@
++package ipguard
+
++
+
++import (
+
++	"io"
+
++	"net"
+
++	"net/http"
+
++	"net/http/httptest"
+
++	"testing"
+
++
+
++	"github.com/gofiber/fiber/v3"
+
++	"github.com/stretchr/testify/require"
+
++)
+
++
+
++// mockIPExtractor returns an IPExtractor function that always returns the given IP.
+
++func mockIPExtractor(ip string) func(c fiber.Ctx) string {
+
++	return func(_ fiber.Ctx) string {
+
++		return ip
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_AllowedIP
+
++func TestIPGuard_AllowedIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	tests := []struct {
+
++		name           string
+
++		allowedIPs     []string
+
++		clientIP       string
+
++		expectedStatus int
+
++	}{
+
++		{
+
++			name:           "allowed single IPv4",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			clientIP:       "192.168.1.1",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "blocked single IPv4",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			clientIP:       "10.0.0.1",
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "allowed IPv4 in CIDR range",
+
++			allowedIPs:     []string{"192.168.1.0/24"},
+
++			clientIP:       "192.168.1.100",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "blocked IPv4 not in CIDR range",
+
++			allowedIPs:     []string{"192.168.1.0/24"},
+
++			clientIP:       "192.168.2.1",
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "allowed single IPv6",
+
++			allowedIPs:     []string{"::1"},
+
++			clientIP:       "::1",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "blocked IPv6 not in list",
+
++			allowedIPs:     []string{"::1"},
+
++			clientIP:       "::2",
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "allowed IPv6 in CIDR range",
+
++			allowedIPs:     []string{"2001:db8::/32"},
+
++			clientIP:       "2001:db8::1",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "blocked IPv6 not in CIDR range",
+
++			allowedIPs:     []string{"2001:db8::/32"},
+
++			clientIP:       "2001:db9::1",
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "mixed IPv4 and IPv6 CIDRs - allowed IPv4",
+
++			allowedIPs:     []string{"10.0.0.0/8", "2001:db8::/32"},
+
++			clientIP:       "10.5.5.5",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "mixed IPv4 and IPv6 CIDRs - allowed IPv6",
+
++			allowedIPs:     []string{"10.0.0.0/8", "2001:db8::/32"},
+
++			clientIP:       "2001:db8::100",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "multiple single IPs - allowed",
+
++			allowedIPs:     []string{"1.2.3.4", "5.6.7.8"},
+
++			clientIP:       "5.6.7.8",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "multiple single IPs - blocked",
+
++			allowedIPs:     []string{"1.2.3.4", "5.6.7.8"},
+
++			clientIP:       "9.9.9.9",
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "IPv4 loopback",
+
++			allowedIPs:     []string{"127.0.0.0/8"},
+
++			clientIP:       "127.0.0.1",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "large CIDR range /16",
+
++			allowedIPs:     []string{"172.16.0.0/16"},
+
++			clientIP:       "172.16.255.255",
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			app := fiber.New()
+
++			app.Use(New(Config{
+
++				AllowedIPs:  tt.allowedIPs,
+
++				IPExtractor: mockIPExtractor(tt.clientIP),
+
++			}))
+
++
+
++			app.Get("/", func(c fiber.Ctx) error {
+
++				return c.SendString("OK")
+
++			})
+
++
+
++			req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++			resp, err := app.Test(req)
+
++			require.NoError(t, err)
+
++			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_ExcludedPaths
+
++func TestIPGuard_ExcludedPaths(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	tests := []struct {
+
++		name           string
+
++		path           string
+
++		excludedPaths  []string
+
++		clientIP       string
+
++		allowedIPs     []string
+
++		expectedStatus int
+
++	}{
+
++		{
+
++			name:           "excluded path bypasses check",
+
++			path:           "/health",
+
++			excludedPaths:  []string{"/health"},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "excluded path prefix matches subpath",
+
++			path:           "/health/live",
+
++			excludedPaths:  []string{"/health"},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "non-excluded path is blocked",
+
++			path:           "/api/data",
+
++			excludedPaths:  []string{"/health", "/public"},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "multiple excluded paths - match second",
+
++			path:           "/public/assets",
+
++			excludedPaths:  []string{"/health", "/public"},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "no excluded paths - blocked",
+
++			path:           "/api",
+
++			excludedPaths:  []string{},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "prefix match includes longer paths sharing the prefix",
+
++			path:           "/healthcheck",
+
++			excludedPaths:  []string{"/health"},
+
++			clientIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK, // HasPrefix("/healthcheck", "/health") == true
+
++		},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			app := fiber.New()
+
++			app.Use(New(Config{
+
++				AllowedIPs:    tt.allowedIPs,
+
++				ExcludedPaths: tt.excludedPaths,
+
++				IPExtractor:   mockIPExtractor(tt.clientIP),
+
++			}))
+
++
+
++			app.Get("/*", func(c fiber.Ctx) error {
+
++				return c.SendString("OK")
+
++			})
+
++
+
++			req := httptest.NewRequest(fiber.MethodGet, tt.path, http.NoBody)
+
++
+
++			resp, err := app.Test(req)
+
++			require.NoError(t, err)
+
++			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_ExcludedExactPaths
+
++func TestIPGuard_ExcludedExactPaths(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	tests := []struct {
+
++		name               string
+
++		path               string
+
++		excludedExactPaths []string
+
++		clientIP           string
+
++		allowedIPs         []string
+
++		expectedStatus     int
+
++	}{
+
++		{
+
++			name:               "exact match bypasses check",
+
++			path:               "/health",
+
++			excludedExactPaths: []string{"/health"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusOK,
+
++		},
+
++		{
+
++			name:               "exact path does not match longer path",
+
++			path:               "/healthcheck",
+
++			excludedExactPaths: []string{"/health"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:               "exact path does not match subpath",
+
++			path:               "/health/live",
+
++			excludedExactPaths: []string{"/health"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:               "multiple exact paths - match first",
+
++			path:               "/health",
+
++			excludedExactPaths: []string{"/health", "/public"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusOK,
+
++		},
+
++		{
+
++			name:               "multiple exact paths - match second",
+
++			path:               "/public",
+
++			excludedExactPaths: []string{"/health", "/public"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusOK,
+
++		},
+
++		{
+
++			name:               "no exact path match - blocked",
+
++			path:               "/api",
+
++			excludedExactPaths: []string{"/health", "/public"},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:               "empty exact paths list - blocked",
+
++			path:               "/health",
+
++			excludedExactPaths: []string{},
+
++			clientIP:           "10.0.0.1",
+
++			allowedIPs:         []string{"192.168.1.1"},
+
++			expectedStatus:     fiber.StatusForbidden,
+
++		},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			app := fiber.New()
+
++			app.Use(New(Config{
+
++				AllowedIPs:         tt.allowedIPs,
+
++				ExcludedExactPaths: tt.excludedExactPaths,
+
++				IPExtractor:        mockIPExtractor(tt.clientIP),
+
++			}))
+
++
+
++			app.Get("/*", func(c fiber.Ctx) error {
+
++				return c.SendString("OK")
+
++			})
+
++
+
++			req := httptest.NewRequest(fiber.MethodGet, tt.path, http.NoBody)
+
++
+
++			resp, err := app.Test(req)
+
++			require.NoError(t, err)
+
++			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_ExcludedExactAndPrefixCombined
+
++func TestIPGuard_ExcludedExactAndPrefixCombined(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("exact match takes priority over prefix", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:         []string{"192.168.1.1"},
+
++			ExcludedExactPaths: []string{"/health"},
+
++			ExcludedPaths:      []string{"/api"},
+
++			IPExtractor:        mockIPExtractor("10.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/*", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		// Exact match on /health
+
++		req := httptest.NewRequest(fiber.MethodGet, "/health", http.NoBody)
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++
+
++		// Prefix match on /api/users
+
++		req = httptest.NewRequest(fiber.MethodGet, "/api/users", http.NoBody)
+
++		resp, err = app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++
+
++		// No match on /other
+
++		req = httptest.NewRequest(fiber.MethodGet, "/other", http.NoBody)
+
++		resp, err = app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++
+
++		// Exact /health does NOT match /healthcheck
+
++		req = httptest.NewRequest(fiber.MethodGet, "/healthcheck", http.NoBody)
+
++		resp, err = app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_XForwardedFor
+
++func TestIPGuard_XForwardedFor(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	tests := []struct {
+
++		name             string
+
++		useXForwardedFor bool
+
++		xffHeader        string
+
++		remoteIP         string
+
++		allowedIPs       []string
+
++		expectedStatus   int
+
++	}{
+
++		{
+
++			name:             "XFF enabled - first IP in header matches whitelist",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "192.168.1.1, 10.0.0.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - first IP in header not in whitelist",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "9.9.9.9, 10.0.0.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:             "XFF disabled - ignores header even if IP matches",
+
++			useXForwardedFor: false,
+
++			xffHeader:        "192.168.1.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:             "XFF enabled - single IP in header",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "192.168.1.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - IPv6 in header",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "2001:db8::1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"2001:db8::1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - IPv6 CIDR match in header",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "2001:db8::100, ::1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"2001:db8::/32"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - empty header falls back to c.IP() which is 0.0.0.0 in test",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "",
+
++			remoteIP:         "0.0.0.0",
+
++			allowedIPs:       []string{"0.0.0.0"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - empty header falls back to c.IP() which may not be whitelisted",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "",
+
++			remoteIP:         "0.0.0.0",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:             "XFF enabled - header with spaces",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "  192.168.1.1  ,  10.0.0.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - invalid first IP skipped, second valid IP used",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "not-an-ip, 192.168.1.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - all invalid IPs in header fall back to c.IP()",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "not-an-ip, another-bad-ip",
+
++			remoteIP:         "0.0.0.0",
+
++			allowedIPs:       []string{"0.0.0.0"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++		{
+
++			name:             "XFF enabled - all invalid IPs in header fall back to c.IP() which may not be whitelisted",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "not-an-ip, another-bad-ip",
+
++			remoteIP:         "0.0.0.0",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:             "XFF enabled - malicious value in header skipped",
+
++			useXForwardedFor: true,
+
++			xffHeader:        "<script>alert(1)</script>, 192.168.1.1",
+
++			remoteIP:         "10.0.0.1",
+
++			allowedIPs:       []string{"192.168.1.1"},
+
++			expectedStatus:   fiber.StatusOK,
+
++		},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			app := fiber.New(fiber.Config{TrustProxy: true, ProxyHeader: fiber.HeaderXForwardedFor})
+
++			app.Use(New(Config{
+
++				AllowedIPs:       tt.allowedIPs,
+
++				UseXForwardedFor: tt.useXForwardedFor,
+
++			}))
+
++
+
++			app.Get("/", func(c fiber.Ctx) error {
+
++				return c.SendString("OK")
+
++			})
+
++
+
++			req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++			if tt.xffHeader != "" {
+
++				req.Header.Set(fiber.HeaderXForwardedFor, tt.xffHeader)
+
++			}
+
++
+
++			resp, err := app.Test(req)
+
++			require.NoError(t, err)
+
++			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_ForbiddenHandler
+
++func TestIPGuard_ForbiddenHandler(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("default forbidden handler returns 403", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("10.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("custom forbidden handler returns custom response", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("10.0.0.1"),
+
++			ForbiddenHandler: func(c fiber.Ctx) error {
+
++				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+
++					"error": "access denied",
+
++				})
+
++			},
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++
+
++		body, err := io.ReadAll(resp.Body)
+
++		require.NoError(t, err)
+
++		require.Contains(t, string(body), "access denied")
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_Next
+
++func TestIPGuard_Next(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("skip middleware when Next returns true", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			Next: func(_ fiber.Ctx) bool {
+
++				return true
+
++			},
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("10.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("execute middleware when Next returns false", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			Next: func(_ fiber.Ctx) bool {
+
++				return false
+
++			},
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("10.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_EmptyWhitelist
+
++func TestIPGuard_EmptyWhitelist(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	app := fiber.New()
+
++	app.Use(New(Config{
+
++		AllowedIPs:  []string{},
+
++		IPExtractor: mockIPExtractor("192.168.1.1"),
+
++	}))
+
++
+
++	app.Get("/", func(c fiber.Ctx) error {
+
++		return c.SendString("OK")
+
++	})
+
++
+
++	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++	resp, err := app.Test(req)
+
++	require.NoError(t, err)
+
++	require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++}
+
++
+
++// go test -run TestIPGuard_EmptyClientIP
+
++func TestIPGuard_EmptyClientIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	app := fiber.New()
+
++	app.Use(New(Config{
+
++		AllowedIPs:  []string{"192.168.1.1"},
+
++		IPExtractor: mockIPExtractor(""),
+
++	}))
+
++
+
++	app.Get("/", func(c fiber.Ctx) error {
+
++		return c.SendString("OK")
+
++	})
+
++
+
++	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++	resp, err := app.Test(req)
+
++	require.NoError(t, err)
+
++	require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++}
+
++
+
++// go test -run TestIPGuard_InvalidClientIP
+
++func TestIPGuard_InvalidClientIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	app := fiber.New()
+
++	app.Use(New(Config{
+
++		AllowedIPs:  []string{"192.168.1.1"},
+
++		IPExtractor: mockIPExtractor("not-an-ip"),
+
++	}))
+
++
+
++	app.Get("/", func(c fiber.Ctx) error {
+
++		return c.SendString("OK")
+
++	})
+
++
+
++	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++	resp, err := app.Test(req)
+
++	require.NoError(t, err)
+
++	require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++}
+
++
+
++// go test -run TestIPGuard_InvalidAllowedIP
+
++func TestIPGuard_InvalidAllowedIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("panic message includes index and value", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		require.PanicsWithValue(t, "ipguard: allowedIPs[0]: invalid IP/CIDR \"not-an-ip\"", func() {
+
++			New(Config{
+
++				AllowedIPs: []string{"not-an-ip"},
+
++			})
+
++		})
+
++	})
+
++
+
++	t.Run("panic message includes correct index with multiple entries", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		require.PanicsWithValue(t, "ipguard: allowedIPs[2]: invalid IP/CIDR \"bad-ip\"", func() {
+
++			New(Config{
+
++				AllowedIPs: []string{"192.168.1.1", "10.0.0.0/24", "bad-ip"},
+
++			})
+
++		})
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_ParseAllowedIPs
+
++func TestIPGuard_ParseAllowedIPs(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("valid single IPs and CIDRs", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		ips, nets, err := parseAllowedIPs([]string{
+
++			"192.168.1.1",
+
++			"10.0.0.0/24",
+
++			"::1",
+
++			"2001:db8::/32",
+
++		})
+
++		require.NoError(t, err)
+
++		require.Len(t, ips, 2)
+
++		require.Len(t, nets, 2)
+
++	})
+
++
+
++	t.Run("invalid entry includes index and value", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		_, _, err := parseAllowedIPs([]string{"invalid"})
+
++		require.Error(t, err)
+
++		require.Contains(t, err.Error(), "allowedIPs[0]")
+
++		require.Contains(t, err.Error(), "invalid")
+
++	})
+
++
+
++	t.Run("empty list", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		ips, nets, err := parseAllowedIPs([]string{})
+
++		require.NoError(t, err)
+
++		require.Empty(t, ips)
+
++		require.Empty(t, nets)
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_IsIPAllowed
+
++func TestIPGuard_IsIPAllowed(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	ips, nets, err := parseAllowedIPs([]string{"192.168.1.1", "10.0.0.0/24", "::1", "2001:db8::/32"})
+
++	require.NoError(t, err)
+
++
+
++	tests := []struct {
+
++		name     string
+
++		ip       string
+
++		expected bool
+
++	}{
+
++		{"exact IPv4 match", "192.168.1.1", true},
+
++		{"no IPv4 match", "192.168.1.2", false},
+
++		{"IPv4 in CIDR range", "10.0.0.50", true},
+
++		{"IPv4 not in CIDR range", "10.1.0.1", false},
+
++		{"exact IPv6 match", "::1", true},
+
++		{"IPv6 not in list", "::2", false},
+
++		{"IPv6 in CIDR range", "2001:db8::1", true},
+
++		{"IPv6 not in CIDR range", "2001:db9::1", false},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			ip := net.ParseIP(tt.ip)
+
++			require.NotNil(t, ip)
+
++			require.Equal(t, tt.expected, isIPAllowed(ip, ips, nets))
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_XRealIP
+
++func TestIPGuard_XRealIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	tests := []struct {
+
++		name           string
+
++		useXRealIP     bool
+
++		xriHeader      string
+
++		remoteIP       string
+
++		allowedIPs     []string
+
++		expectedStatus int
+
++	}{
+
++		{
+
++			name:           "X-Real-IP enabled - header IP matches whitelist",
+
++			useXRealIP:     true,
+
++			xriHeader:      "192.168.1.1",
+
++			remoteIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - header IP not in whitelist",
+
++			useXRealIP:     true,
+
++			xriHeader:      "9.9.9.9",
+
++			remoteIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "X-Real-IP disabled - ignores header even if IP matches",
+
++			useXRealIP:     false,
+
++			xriHeader:      "192.168.1.1",
+
++			remoteIP:       "0.0.0.0",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - IPv6 in header",
+
++			useXRealIP:     true,
+
++			xriHeader:      "2001:db8::1",
+
++			remoteIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"2001:db8::1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - empty header falls back to c.IP()",
+
++			useXRealIP:     true,
+
++			xriHeader:      "",
+
++			remoteIP:       "0.0.0.0",
+
++			allowedIPs:     []string{"0.0.0.0"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - invalid IP in header falls back to c.IP()",
+
++			useXRealIP:     true,
+
++			xriHeader:      "not-an-ip",
+
++			remoteIP:       "0.0.0.0",
+
++			allowedIPs:     []string{"0.0.0.0"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - invalid IP in header not whitelisted",
+
++			useXRealIP:     true,
+
++			xriHeader:      "not-an-ip",
+
++			remoteIP:       "0.0.0.0",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusForbidden,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - header with spaces",
+
++			useXRealIP:     true,
+
++			xriHeader:      "  192.168.1.1  ",
+
++			remoteIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"192.168.1.1"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - IPv6 CIDR match in header",
+
++			useXRealIP:     true,
+
++			xriHeader:      "2001:db8::100",
+
++			remoteIP:       "10.0.0.1",
+
++			allowedIPs:     []string{"2001:db8::/32"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++		{
+
++			name:           "X-Real-IP enabled - malicious value in header skipped",
+
++			useXRealIP:     true,
+
++			xriHeader:      "<script>alert(1)</script>",
+
++			remoteIP:       "0.0.0.0",
+
++			allowedIPs:     []string{"0.0.0.0"},
+
++			expectedStatus: fiber.StatusOK,
+
++		},
+
++	}
+
++
+
++	for _, tt := range tests {
+
++		t.Run(tt.name, func(t *testing.T) {
+
++			t.Parallel()
+
++
+
++			app := fiber.New(fiber.Config{TrustProxy: true})
+
++			app.Use(New(Config{
+
++				AllowedIPs:  tt.allowedIPs,
+
++				UseXRealIP:  tt.useXRealIP,
+
++				IPExtractor: nil,
+
++			}))
+
++
+
++			app.Get("/", func(c fiber.Ctx) error {
+
++				return c.SendString("OK")
+
++			})
+
++
+
++			req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++			if tt.xriHeader != "" {
+
++				req.Header.Set("X-Real-IP", tt.xriHeader)
+
++			}
+
++
+
++			resp, err := app.Test(req)
+
++			require.NoError(t, err)
+
++			require.Equal(t, tt.expectedStatus, resp.StatusCode)
+
++		})
+
++	}
+
++}
+
++
+
++// go test -run TestIPGuard_XForwardedForPriorityOverXRealIP
+
++func TestIPGuard_XForwardedForPriorityOverXRealIP(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("XFF takes priority over X-Real-IP when both enabled", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New(fiber.Config{TrustProxy: true, ProxyHeader: fiber.HeaderXForwardedFor})
+
++		app.Use(New(Config{
+
++			AllowedIPs:       []string{"192.168.1.1"},
+
++			UseXForwardedFor: true,
+
++			UseXRealIP:       true,
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++		req.Header.Set(fiber.HeaderXForwardedFor, "192.168.1.1")
+
++		req.Header.Set("X-Real-IP", "9.9.9.9")
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("X-Real-IP is used when XFF is enabled but header is empty", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New(fiber.Config{TrustProxy: true, ProxyHeader: fiber.HeaderXForwardedFor})
+
++		app.Use(New(Config{
+
++			AllowedIPs:       []string{"192.168.1.1"},
+
++			UseXForwardedFor: true,
+
++			UseXRealIP:       true,
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++		req.Header.Set("X-Real-IP", "192.168.1.1")
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_IPExtractorOverridesXFF
+
++func TestIPGuard_IPExtractorOverridesXFF(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	app := fiber.New(fiber.Config{TrustProxy: true, ProxyHeader: fiber.HeaderXForwardedFor})
+
++	app.Use(New(Config{
+
++		AllowedIPs:       []string{"10.0.0.1"},
+
++		UseXForwardedFor: true,
+
++		IPExtractor:      mockIPExtractor("10.0.0.1"),
+
++	}))
+
++
+
++	app.Get("/", func(c fiber.Ctx) error {
+
++		return c.SendString("OK")
+
++	})
+
++
+
++	// Even though XFF header says 9.9.9.9, IPExtractor takes priority
+
++	req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++	req.Header.Set(fiber.HeaderXForwardedFor, "9.9.9.9")
+
++
+
++	resp, err := app.Test(req)
+
++	require.NoError(t, err)
+
++	require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++}
+
++
+
++// go test -run TestIPGuard_NormalizeIPv4MappedIPv6
+
++func TestIPGuard_NormalizeIPv4MappedIPv6(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("IPv4-mapped IPv6 matches plain IPv4 in whitelist", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("::ffff:192.168.1.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("IPv4-mapped IPv6 matches IPv4 CIDR", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.0/24"},
+
++			IPExtractor: mockIPExtractor("::ffff:192.168.1.100"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("plain IPv4 still works", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("192.168.1.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("pure IPv6 still works", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"2001:db8::1"},
+
++			IPExtractor: mockIPExtractor("2001:db8::1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("IPv4-mapped IPv6 blocked when not in whitelist", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("::ffff:10.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("IPv4-mapped IPv6 loopback matches 127.0.0.1", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"127.0.0.0/8"},
+
++			IPExtractor: mockIPExtractor("::ffff:127.0.0.1"),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("default config has NormalizeIPv4MappedIPv6 enabled", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		cfg := configDefault()
+
++		require.NotNil(t, cfg.NormalizeIPv4MappedIPv6)
+
++		require.True(t, *cfg.NormalizeIPv4MappedIPv6)
+
++	})
+
++
+
++	t.Run("NormalizeIPv4MappedIPv6 can be explicitly disabled", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:              []string{"192.168.1.1"},
+
++			IPExtractor:             mockIPExtractor("::ffff:192.168.1.1"),
+
++			NormalizeIPv4MappedIPv6: boolPtr(false),
+
++		}))
+
++
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		// Note: Go's net.ParseIP represents "::ffff:192.168.1.1" and "192.168.1.1"
+
++		// identically as 16-byte IPv4-mapped IPv6 addresses. Even with normalization
+
++		// disabled, Go's Equal() and Contains() still treat them as equivalent.
+
++		// Disabling normalization only prevents the 16→4 byte conversion, but matching
+
++		// still works due to Go's built-in equivalence handling.
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++}
+
++
+
++// go test -run TestIPGuard_ClientIPFromContext
+
++func TestIPGuard_ClientIPFromContext(t *testing.T) {
+
++	t.Parallel()
+
++
+
++	t.Run("client IP stored in context with default key", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var resolvedIP string
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("192.168.1.1"),
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			resolvedIP = ClientIPFromContext(c)
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++		require.Equal(t, "192.168.1.1", resolvedIP)
+
++	})
+
++
+
++	t.Run("client IP stored with IPv6", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var resolvedIP string
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"2001:db8::1"},
+
++			IPExtractor: mockIPExtractor("2001:db8::1"),
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			resolvedIP = ClientIPFromContext(c)
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++		require.Equal(t, "2001:db8::1", resolvedIP)
+
++	})
+
++
+
++	t.Run("IPv4-mapped IPv6 normalized in context", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var resolvedIP string
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("::ffff:192.168.1.1"),
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			resolvedIP = ClientIPFromContext(c)
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++		require.Equal(t, "192.168.1.1", resolvedIP)
+
++	})
+
++
+
++	t.Run("client IP available even when request is blocked", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var resolvedIP string
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("10.0.0.1"),
+
++			ForbiddenHandler: func(c fiber.Ctx) error {
+
++				resolvedIP = ClientIPFromContext(c)
+
++				return c.SendStatus(fiber.StatusForbidden)
+
++			},
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusForbidden, resp.StatusCode)
+
++		require.Equal(t, "10.0.0.1", resolvedIP)
+
++	})
+
++
+
++	t.Run("custom context key - stored under both default and custom keys", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var customKeyIP, defaultKeyIP string
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:  []string{"192.168.1.1"},
+
++			IPExtractor: mockIPExtractor("192.168.1.1"),
+
++			ContextKey:  "my-custom-ip",
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			customKeyIP, _ = c.Locals("my-custom-ip").(string)
+
++			defaultKeyIP = ClientIPFromContext(c)
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++		require.Equal(t, "192.168.1.1", customKeyIP)
+
++		require.Equal(t, "192.168.1.1", defaultKeyIP)
+
++	})
+
++
+
++	t.Run("DisableContextStorage prevents storing in context", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Use(New(Config{
+
++			AllowedIPs:            []string{"192.168.1.1"},
+
++			IPExtractor:           mockIPExtractor("192.168.1.1"),
+
++			DisableContextStorage: true,
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			// ClientIPFromContext should return empty string when storage is disabled
+
++			ip := ClientIPFromContext(c)
+
++			if ip != "" {
+
++				return c.Status(500).SendString("unexpected IP: " + ip)
+
++			}
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("ClientIPFromContext returns empty when middleware not used", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		app := fiber.New()
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			ip := ClientIPFromContext(c)
+
++			if ip != "" {
+
++				return c.Status(500).SendString("unexpected IP: " + ip)
+
++			}
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++	})
+
++
+
++	t.Run("client IP from XFF header stored in context", func(t *testing.T) {
+
++		t.Parallel()
+
++
+
++		var resolvedIP string
+
++		app := fiber.New(fiber.Config{TrustProxy: true, ProxyHeader: fiber.HeaderXForwardedFor})
+
++		app.Use(New(Config{
+
++			AllowedIPs:       []string{"192.168.1.1"},
+
++			UseXForwardedFor: true,
+
++		}))
+
++		app.Get("/", func(c fiber.Ctx) error {
+
++			resolvedIP = ClientIPFromContext(c)
+
++			return c.SendString("OK")
+
++		})
+
++
+
++		req := httptest.NewRequest(fiber.MethodGet, "/", http.NoBody)
+
++		req.Header.Set(fiber.HeaderXForwardedFor, "192.168.1.1")
+
++
+
++		resp, err := app.Test(req)
+
++		require.NoError(t, err)
+
++		require.Equal(t, fiber.StatusOK, resp.StatusCode)
+
++		require.Equal(t, "192.168.1.1", resolvedIP)
+
++	})
+
++}
+
