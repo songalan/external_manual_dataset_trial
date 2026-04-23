@@ -1,0 +1,6 @@
+name: drizzle-soft-delete
+channels:
+  - conda-forge
+dependencies:
+  - nodejs=22
+  - pip
