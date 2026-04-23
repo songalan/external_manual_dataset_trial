@@ -1,0 +1,8 @@
+{
+  "extends": "@foxglove/tsconfig/node",
+  "include": ["*.ts"],
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist"
+  }
+}

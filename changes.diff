@@ -1,0 +1,1432 @@
+﻿diff --git a/case_collection_issue_output/init/main.go b/case_collection_issue_output/final/main.go
+index 514a8e4..059e85d 100644
+--- a/case_collection_issue_output/init/main.go
++++ b/case_collection_issue_output/final/main.go
+@@ -3,9 +3,11 @@ package main
+ import (
+ 	"errors"
+ 	"fmt"
++	"io"
+ 	"net/url"
+ 	"os"
+ 	"regexp"
++	"strings"
+ 
+ 	"github.com/joho/godotenv"
+ 	"github.com/urfave/cli/v2"
+@@ -200,15 +202,167 @@ func NewApp() *cli.App {
+ 					Name:  "quiet",
+ 					Usage: "don't output any text (implies --exit-code)",
+ 				},
++				&cli.StringFlag{
++					Name:    "format",
++					Aliases: []string{"f"},
++					EnvVars: []string{"DBMATE_STATUS_FORMAT"},
++					Usage:   "output format: table (default), json",
++					Value:   "table",
++				},
++				&cli.BoolFlag{
++					Name:    "no-header",
++					EnvVars: []string{"DBMATE_STATUS_NO_HEADER"},
++					Usage:   "hide table header row (only applies to table format)",
++				},
++				&cli.StringFlag{
++					Name:    "sort",
++					EnvVars: []string{"DBMATE_STATUS_SORT"},
++					Usage:   "sort migrations by field: version (default), status, name, modified",
++					Value:   "version",
++				},
++				&cli.IntFlag{
++					Name:    "page",
++					EnvVars: []string{"DBMATE_STATUS_PAGE"},
++					Usage:   "page number for paginated output (1-based, requires --page-size)",
++					Value:   0,
++				},
++				&cli.IntFlag{
++					Name:    "page-size",
++					EnvVars: []string{"DBMATE_STATUS_PAGE_SIZE"},
++					Usage:   "number of migrations per page (requires --page)",
++					Value:   0,
++				},
++				&cli.IntFlag{
++					Name:    "limit",
++					EnvVars: []string{"DBMATE_STATUS_LIMIT"},
++					Usage:   "limit the number of migrations displayed (cannot be used with --page/--page-size)",
++					Value:   0,
++				},
++				&cli.IntFlag{
++					Name:    "pretty",
++					EnvVars: []string{"DBMATE_STATUS_PRETTY"},
++					Usage:   "pretty-print JSON output with specified indentation spaces (only applies to json format). 0 disables, default is 2",
++					Value:   2,
++				},
++				&cli.StringFlag{
++					Name:    "filter",
++					EnvVars: []string{"DBMATE_STATUS_FILTER"},
++					Usage:   "filter migrations by status: applied, pending",
++				},
++				&cli.BoolFlag{
++					Name:    "color",
++					EnvVars: []string{"DBMATE_STATUS_COLOR"},
++					Usage:   "force color output (only applies to table format)",
++				},
++				&cli.BoolFlag{
++					Name:    "no-color",
++					EnvVars: []string{"DBMATE_STATUS_NO_COLOR"},
++					Usage:   "disable color output (only applies to table format)",
++				},
+ 			},
+ 			Action: action(func(db *dbmate.DB, c *cli.Context) error {
+ 				db.Strict = c.Bool("strict")
+ 				setExitCode := c.Bool("exit-code")
+ 				quiet := c.Bool("quiet")
++				format := c.String("format")
++				noHeader := c.Bool("no-header")
++				sortBy := c.String("sort")
++				page := c.Int("page")
++				pageSize := c.Int("page-size")
++				limit := c.Int("limit")
++				pretty := c.Int("pretty")
++				filter := c.String("filter")
++				useColor := false
++				if c.Bool("color") && c.Bool("no-color") {
++					return fmt.Errorf("--color and --no-color cannot be used together")
++				}
++				if c.Bool("color") {
++					useColor = true
++				} else if c.Bool("no-color") {
++					useColor = false
++				} else {
++					// Auto-detect: enable color if stdout is a terminal
++					useColor = isTerminal(db.Log)
++				}
+ 				if quiet {
+ 					setExitCode = true
+ 				}
+ 
++				if format != "" && format != "table" && format != "json" {
++					return fmt.Errorf("invalid format: %s (supported: table, json)", format)
++				}
++
++				if sortBy != "" && sortBy != "version" && sortBy != "status" && sortBy != "name" && sortBy != "modified" {
++					return fmt.Errorf("invalid sort: %s (supported: version, status, name, modified)", sortBy)
++				}
++
++				if filter != "" && filter != "applied" && filter != "pending" {
++					return fmt.Errorf("invalid filter: %s (supported: applied, pending)", filter)
++				}
++
++				// Validate pagination flags
++				if (page > 0 && pageSize <= 0) || (page <= 0 && pageSize > 0) {
++					return fmt.Errorf("--page and --page-size must be used together")
++				}
+git : warning: in the working copy of 'case_collection_issue_output/final/pkg/dbmate/dashboard_test.go', LF will be rep
+laced by CRLF the next time Git touches it
+所在位置 行:1 字符: 195
++ ... ate/dbmate; git diff --no-index case_collection_issue_output/init cas ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
++				if page < 0 || pageSize < 0 {
++					return fmt.Errorf("--page and --page-size must be non-negative")
++				}
++				if limit < 0 {
++					return fmt.Errorf("--limit must be non-negative")
++				}
++				if limit > 0 && (page > 0 || pageSize > 0) {
++					return fmt.Errorf("--limit cannot be used with --page/--page-size")
++				}
++
++				// Compute JSON indent string from --pretty flag
++				var jsonIndent string
++				if pretty > 0 {
++					jsonIndent = strings.Repeat(" ", pretty)
++				}
++				// pretty == 0 means compact (no indent)
++
++				// Use dashboard output for table/json formats
++				if format == "json" {
++					result, err := db.StatusDashboard()
++					if err != nil {
++						return err
++					}
++					dbmate.SortDashboardResult(result, sortBy)
++					dbmate.FilterDashboardResult(result, filter)
++					if limit > 0 {
++						dbmate.LimitDashboardResult(result, limit)
++					} else {
++						dbmate.PaginateDashboardResult(result, page, pageSize)
++					}
++					if err := dbmate.PrintDashboardJSON(db.Log, result, jsonIndent); err != nil {
++						return err
++					}
++					if result.TotalPending > 0 && setExitCode {
++						return cli.Exit("", 1)
++					}
++					return nil
++				}
++
++				if format == "table" && !quiet {
++					result, err := db.StatusDashboard()
++					if err != nil {
++						return err
++					}
++					dbmate.SortDashboardResult(result, sortBy)
++					dbmate.FilterDashboardResult(result, filter)
++					if limit > 0 {
++						dbmate.LimitDashboardResult(result, limit)
++					} else {
++						dbmate.PaginateDashboardResult(result, page, pageSize)
++					}
++					dbmate.PrintDashboardTable(db.Log, result, noHeader, useColor)
++					if result.TotalPending > 0 && setExitCode {
++						return cli.Exit("", 1)
++					}
++					return nil
++				}
++
++				// Fallback to original behavior for quiet mode
+ 				pending, err := db.Status(quiet)
+ 				if err != nil {
+ 					return err
+@@ -341,6 +495,16 @@ func getDatabaseURL(c *cli.Context) (u *url.URL, err error) {
+ 	return url.Parse(value)
+ }
+ 
++// isTerminal checks if the writer is a terminal that supports ANSI colors
++func isTerminal(w io.Writer) bool {
++	if f, ok := w.(*os.File); ok {
++		// On Windows, check if the file descriptor is a console
++		// A simple heuristic: check if it's stdout or stderr
++		return f == os.Stdout || f == os.Stderr
++	}
++	return false
++}
++
+ // redactLogString attempts to redact passwords from errors
+ func redactLogString(in string) string {
+ 	re := regexp.MustCompile("([a-zA-Z]+://[^:]+:)[^@]+@")
+diff --git a/case_collection_issue_output/final/pkg/dbmate/dashboard_test.go b/case_collection_issue_output/final/pkg/dbmate/dashboard_test.go
+new file mode 100644
+index 0000000..44a5bb1
+--- /dev/null
++++ b/case_collection_issue_output/final/pkg/dbmate/dashboard_test.go
+@@ -0,0 +1,796 @@
++package dbmate_test
++
++import (
++	"bytes"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/amacneil/dbmate/v2/pkg/dbmate"
++	"github.com/stretchr/testify/require"
++)
++
++func TestPrintDashboardTableEmpty(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 0,
++		TotalPending: 0,
++		Total:        0,
++		Migrations:   nil,
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	require.Equal(t, "No migrations found.\n", buf.String())
++}
++
++func TestPrintDashboardTableWithMigrations(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 1,
++		Total:        3,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-01-01T00:00:00Z",
++			},
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-02-01T00:00:00Z",
++			},
++			{
++				Version:  "20230301000000",
++				FileName: "20230301000000_add_email.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++
++	// Check table structure
++	require.Contains(t, output, "Status")
++	require.Contains(t, output, "Version")
++	require.Contains(t, output, "Migration Name")
++	require.Contains(t, output, "Modified")
++
++	// Check status markers
++	require.Contains(t, output, "[X]")
++	require.Contains(t, output, "[ ]")
++
++	// Check migration names
++	require.Contains(t, output, "20230101000000_create_users.sql")
++	require.Contains(t, output, "20230201000000_create_posts.sql")
++	require.Contains(t, output, "20230301000000_add_email.sql")
++
++	// Check summary
++	require.Contains(t, output, "Applied: 2")
++	require.Contains(t, output, "Pending: 1")
++	require.Contains(t, output, "Total: 3")
++}
++
++func TestPrintDashboardTableAlignment(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 1,
++		Total:        2,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "1",
++				FileName: "1_short.sql",
++				Applied:  true,
++				Status:   "applied",
++			},
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_a_very_long_migration_name.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++
++	// Verify separators exist (table structure)
++	require.Contains(t, output, "+")
++	require.Contains(t, output, "-")
++	require.Contains(t, output, "|")
++
++	// All separator lines should have the same length
++	lines := strings.Split(output, "\n")
++	var separatorLines []string
++	for _, l := range lines {
++		if strings.HasPrefix(strings.TrimSpace(l), "+") {
++			separatorLines = append(separatorLines, l)
++		}
++	}
++	if len(separatorLines) >= 2 {
++		require.Equal(t, len(separatorLines[0]), len(separatorLines[1]),
++			"separator lines should have consistent width")
++	}
++}
++
++func TestPrintDashboardJSON(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 1,
++		Total:        3,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-01-01T00:00:00Z",
++			},
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  true,
++				Status:   "applied",
++			},
++			{
++				Version:  "20230301000000",
++				FileName: "20230301000000_add_email.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	err := dbmate.PrintDashboardJSON(&buf, result, "  ")
++	require.NoError(t, err)
++
++	// Verify it's valid JSON
++	var parsed dbmate.DashboardResult
++	err = json.Unmarshal(buf.Bytes(), &parsed)
++	require.NoError(t, err)
++
++	require.Equal(t, 2, parsed.TotalApplied)
++	require.Equal(t, 1, parsed.TotalPending)
++	require.Equal(t, 3, parsed.Total)
++	require.Len(t, parsed.Migrations, 3)
++
++	// Check first migration
++	require.Equal(t, "20230101000000", parsed.Migrations[0].Version)
++	require.Equal(t, "20230101000000_create_users.sql", parsed.Migrations[0].FileName)
++	require.True(t, parsed.Migrations[0].Applied)
++	require.Equal(t, "applied", parsed.Migrations[0].Status)
++	require.Equal(t, "2023-01-01T00:00:00Z", parsed.Migrations[0].Modified)
++
++	// Check pending migration
++	require.Equal(t, "20230301000000", parsed.Migrations[2].Version)
++	require.False(t, parsed.Migrations[2].Applied)
++	require.Equal(t, "pending", parsed.Migrations[2].Status)
++}
++
++func TestPrintDashboardJSONEmpty(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 0,
++		TotalPending: 0,
++		Total:        0,
++		Migrations:   nil,
++	}
++
++	var buf bytes.Buffer
++	err := dbmate.PrintDashboardJSON(&buf, result, "  ")
++	require.NoError(t, err)
++
++	var parsed dbmate.DashboardResult
++	err = json.Unmarshal(buf.Bytes(), &parsed)
++	require.NoError(t, err)
++
++	require.Equal(t, 0, parsed.TotalApplied)
++	require.Equal(t, 0, parsed.TotalPending)
++	require.Equal(t, 0, parsed.Total)
++	require.Nil(t, parsed.Migrations)
++}
++
++func TestDashboardResultMigrationStatus(t *testing.T) {
++	// Test that the MigrationStatus fields are correctly set
++	ms := dbmate.MigrationStatus{
++		Version:  "20230101000000",
++		FileName: "20230101000000_create_users.sql",
++		Applied:  true,
++		Status:   "applied",
++		Modified: "2023-01-01T00:00:00Z",
++	}
++
++	require.Equal(t, "20230101000000", ms.Version)
++	require.Equal(t, "20230101000000_create_users.sql", ms.FileName)
++	require.True(t, ms.Applied)
++	require.Equal(t, "applied", ms.Status)
++	require.Equal(t, "2023-01-01T00:00:00Z", ms.Modified)
++
++	// Test pending migration
++	msPending := dbmate.MigrationStatus{
++		Version:  "20230301000000",
++		FileName: "20230301000000_add_email.sql",
++		Applied:  false,
++		Status:   "pending",
++	}
++	require.False(t, msPending.Applied)
++	require.Equal(t, "pending", msPending.Status)
++	require.Empty(t, msPending.Modified)
++}
++
++func TestPrintDashboardJSONFieldNames(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 0,
++		Total:        1,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-01-01T00:00:00Z",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	err := dbmate.PrintDashboardJSON(&buf, result, "  ")
++	require.NoError(t, err)
++
++	// Verify JSON field names use camelCase
++	raw := buf.String()
++	require.Contains(t, raw, `"totalApplied"`)
++	require.Contains(t, raw, `"totalPending"`)
++	require.Contains(t, raw, `"fileName"`)
++	require.Contains(t, raw, `"migrations"`)
++}
++
++func TestPrintDashboardJSONPretty(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 0,
++		Total:        1,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "1", FileName: "m1.sql", Applied: true, Status: "applied"},
++		},
++	}
++
++	t.Run("indent with 2 spaces", func(t *testing.T) {
++		var buf bytes.Buffer
++		err := dbmate.PrintDashboardJSON(&buf, result, "  ")
++		require.NoError(t, err)
++		output := buf.String()
++		require.Contains(t, output, "  ")
++		require.Contains(t, output, "\n")
++	})
++
++	t.Run("indent with 4 spaces", func(t *testing.T) {
++		var buf bytes.Buffer
++		err := dbmate.PrintDashboardJSON(&buf, result, "    ")
++		require.NoError(t, err)
++		output := buf.String()
++		require.Contains(t, output, "    ")
++	})
++
++	t.Run("empty indent is compact", func(t *testing.T) {
++		var buf bytes.Buffer
++		err := dbmate.PrintDashboardJSON(&buf, result, "")
++		require.NoError(t, err)
++		output := buf.String()
++		// Compact JSON should be a single line
++		lines := strings.Split(strings.TrimSpace(output), "\n")
++		require.Equal(t, 1, len(lines), "compact JSON should be a single line")
++	})
++}
++
++func TestPrintDashboardTableAllApplied(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 0,
++		Total:        2,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++			},
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  true,
++				Status:   "applied",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++	require.Contains(t, output, "Applied: 2")
++	require.Contains(t, output, "Pending: 0")
++	require.Contains(t, output, "Total: 2")
++	// Should not have [ ] marker
++	require.NotContains(t, output, "[ ]")
++}
++
++func TestPrintDashboardTableAllPending(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 0,
++		TotalPending: 2,
++		Total:        2,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++	require.Contains(t, output, "Applied: 0")
++	require.Contains(t, output, "Pending: 2")
++	require.Contains(t, output, "Total: 2")
++	// Should not have [X] marker
++	require.NotContains(t, output, "[X]")
++}
++
++func TestPrintDashboardTableNoHeader(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 1,
++		Total:        2,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-01-01T00:00:00Z",
++			},
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	// With header (default)
++	var bufWithHeader bytes.Buffer
++	dbmate.PrintDashboardTable(&bufWithHeader, result, false, false)
++	outputWithHeader := bufWithHeader.String()
++	require.Contains(t, outputWithHeader, "| Status ")
++	require.Contains(t, outputWithHeader, "| Version ")
++	require.Contains(t, outputWithHeader, "| Migration Name ")
++	require.Contains(t, outputWithHeader, "| Modified ")
++
++	// Without header (--no-header)
++	var bufNoHeader bytes.Buffer
++	dbmate.PrintDashboardTable(&bufNoHeader, result, true, false)
++	outputNoHeader := bufNoHeader.String()
++	require.NotContains(t, outputNoHeader, "| Status ")
++	require.NotContains(t, outputNoHeader, "| Version ")
++	require.NotContains(t, outputNoHeader, "| Migration Name ")
++	require.NotContains(t, outputNoHeader, "| Modified ")
++
++	// Both should have data rows and summary
++	for _, output := range []string{outputWithHeader, outputNoHeader} {
++		require.Contains(t, output, "[X]")
++		require.Contains(t, output, "[ ]")
++		require.Contains(t, output, "20230101000000_create_users.sql")
++		require.Contains(t, output, "20230201000000_create_posts.sql")
++		require.Contains(t, output, "Applied: 1")
++		require.Contains(t, output, "Pending: 1")
++		require.Contains(t, output, "Total: 2")
++	}
++}
++
++func TestSortDashboardResult(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 2,
++		Total:        4,
++		Migrations: []dbmate.MigrationStatus{
++			{
++				Version:  "20230201000000",
++				FileName: "20230201000000_create_posts.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-02-01T00:00:00Z",
++			},
++			{
++				Version:  "20230401000000",
++				FileName: "20230401000000_add_tags.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++			{
++				Version:  "20230101000000",
++				FileName: "20230101000000_create_users.sql",
++				Applied:  true,
++				Status:   "applied",
++				Modified: "2023-01-01T00:00:00Z",
++			},
++			{
++				Version:  "20230301000000",
++				FileName: "20230301000000_add_email.sql",
++				Applied:  false,
++				Status:   "pending",
++			},
++		},
++	}
++
++	t.Run("sort by version (default)", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.SortDashboardResult(r, "version")
++		require.Equal(t, "20230101000000", r.Migrations[0].Version)
++		require.Equal(t, "20230201000000", r.Migrations[1].Version)
++		require.Equal(t, "20230301000000", r.Migrations[2].Version)
++		require.Equal(t, "20230401000000", r.Migrations[3].Version)
++	})
++
++	t.Run("sort by status (applied first)", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.SortDashboardResult(r, "status")
++		// applied first
++		require.True(t, r.Migrations[0].Applied)
++		require.True(t, r.Migrations[1].Applied)
++		require.False(t, r.Migrations[2].Applied)
++		require.False(t, r.Migrations[3].Applied)
++		// within same status, sorted by version
++		require.Equal(t, "20230101000000", r.Migrations[0].Version)
++		require.Equal(t, "20230201000000", r.Migrations[1].Version)
++		require.Equal(t, "20230301000000", r.Migrations[2].Version)
++		require.Equal(t, "20230401000000", r.Migrations[3].Version)
++	})
++
++	t.Run("sort by name", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.SortDashboardResult(r, "name")
++		require.Equal(t, "20230101000000_create_users.sql", r.Migrations[0].FileName)
++		require.Equal(t, "20230201000000_create_posts.sql", r.Migrations[1].FileName)
++		require.Equal(t, "20230301000000_add_email.sql", r.Migrations[2].FileName)
++		require.Equal(t, "20230401000000_add_tags.sql", r.Migrations[3].FileName)
++	})
++
++	t.Run("sort by modified (most recent first)", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.SortDashboardResult(r, "modified")
++		// entries with modified dates come first (most recent), then empty
++		require.Equal(t, "2023-02-01T00:00:00Z", r.Migrations[0].Modified)
++		require.Equal(t, "2023-01-01T00:00:00Z", r.Migrations[1].Modified)
++		// entries without modified dates come after, sorted by version
++		require.Equal(t, "20230301000000", r.Migrations[2].Version)
++		require.Equal(t, "20230401000000", r.Migrations[3].Version)
++	})
++
++	t.Run("sort by empty string defaults to version", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.SortDashboardResult(r, "")
++		require.Equal(t, "20230101000000", r.Migrations[0].Version)
++	})
++}
++
++// cloneDashboardResult creates a deep copy for test isolation
++func cloneDashboardResult(r *dbmate.DashboardResult) *dbmate.DashboardResult {
++	clone := &dbmate.DashboardResult{
++		TotalApplied: r.TotalApplied,
++		TotalPending: r.TotalPending,
++		Total:        r.Total,
++		Migrations:   make([]dbmate.MigrationStatus, len(r.Migrations)),
++	}
++	copy(clone.Migrations, r.Migrations)
++	return clone
++}
++
++func TestFilterDashboardResult(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 3,
++		Total:        5,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "1", FileName: "m1.sql", Applied: true, Status: "applied"},
++			{Version: "2", FileName: "m2.sql", Applied: true, Status: "applied"},
++			{Version: "3", FileName: "m3.sql", Applied: false, Status: "pending"},
++			{Version: "4", FileName: "m4.sql", Applied: false, Status: "pending"},
++			{Version: "5", FileName: "m5.sql", Applied: false, Status: "pending"},
++		},
++	}
++
++	t.Run("no filter when empty", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.FilterDashboardResult(r, "")
++		require.Len(t, r.Migrations, 5)
++		require.Equal(t, 2, r.TotalApplied)
++		require.Equal(t, 3, r.TotalPending)
++		require.Equal(t, 5, r.Total)
++	})
++
++	t.Run("filter applied", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.FilterDashboardResult(r, "applied")
++		require.Len(t, r.Migrations, 2)
++		require.Equal(t, "1", r.Migrations[0].Version)
++		require.Equal(t, "2", r.Migrations[1].Version)
++		require.Equal(t, 2, r.TotalApplied)
++		require.Equal(t, 0, r.TotalPending)
++		require.Equal(t, 2, r.Total)
++	})
++
++	t.Run("filter pending", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.FilterDashboardResult(r, "pending")
++		require.Len(t, r.Migrations, 3)
++		require.Equal(t, "3", r.Migrations[0].Version)
++		require.Equal(t, "4", r.Migrations[1].Version)
++		require.Equal(t, "5", r.Migrations[2].Version)
++		require.Equal(t, 0, r.TotalApplied)
++		require.Equal(t, 3, r.TotalPending)
++		require.Equal(t, 3, r.Total)
++	})
++
++	t.Run("filter with no matches", func(t *testing.T) {
++		r := &dbmate.DashboardResult{
++			TotalApplied: 2,
++			TotalPending: 0,
++			Total:        2,
++			Migrations: []dbmate.MigrationStatus{
++				{Version: "1", FileName: "m1.sql", Applied: true, Status: "applied"},
++				{Version: "2", FileName: "m2.sql", Applied: true, Status: "applied"},
++			},
++		}
++		dbmate.FilterDashboardResult(r, "pending")
++		require.Len(t, r.Migrations, 0)
++		require.Equal(t, 0, r.TotalApplied)
++		require.Equal(t, 0, r.TotalPending)
++		require.Equal(t, 0, r.Total)
++	})
++}
++
++func TestLimitDashboardResult(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 3,
++		Total:        5,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "1", FileName: "m1.sql", Applied: true, Status: "applied"},
++			{Version: "2", FileName: "m2.sql", Applied: true, Status: "applied"},
++			{Version: "3", FileName: "m3.sql", Applied: false, Status: "pending"},
++			{Version: "4", FileName: "m4.sql", Applied: false, Status: "pending"},
++			{Version: "5", FileName: "m5.sql", Applied: false, Status: "pending"},
++		},
++	}
++
++	t.Run("no limit when limit=0", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.LimitDashboardResult(r, 0)
++		require.Len(t, r.Migrations, 5)
++	})
++
++	t.Run("no limit when limit negative", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.LimitDashboardResult(r, -1)
++		require.Len(t, r.Migrations, 5)
++	})
++
++	t.Run("limit to 2", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.LimitDashboardResult(r, 2)
++		require.Len(t, r.Migrations, 2)
++		require.Equal(t, "1", r.Migrations[0].Version)
++		require.Equal(t, "2", r.Migrations[1].Version)
++	})
++
++	t.Run("limit larger than total", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.LimitDashboardResult(r, 100)
++		require.Len(t, r.Migrations, 5)
++	})
++
++	t.Run("limit equal to total", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.LimitDashboardResult(r, 5)
++		require.Len(t, r.Migrations, 5)
++	})
++}
++
++func TestPaginateDashboardResult(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 3,
++		Total:        5,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "1", FileName: "m1.sql", Applied: true, Status: "applied"},
++			{Version: "2", FileName: "m2.sql", Applied: true, Status: "applied"},
++			{Version: "3", FileName: "m3.sql", Applied: false, Status: "pending"},
++			{Version: "4", FileName: "m4.sql", Applied: false, Status: "pending"},
++			{Version: "5", FileName: "m5.sql", Applied: false, Status: "pending"},
++		},
++	}
++
++	t.Run("no pagination when page=0", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 0, 2)
++		require.Len(t, r.Migrations, 5)
++		require.Equal(t, 0, r.Page)
++		require.Equal(t, 0, r.PageSize)
++		require.Equal(t, 0, r.TotalPages)
++	})
++
++	t.Run("no pagination when pageSize=0", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 1, 0)
++		require.Len(t, r.Migrations, 5)
++		require.Equal(t, 0, r.Page)
++	})
++
++	t.Run("page 1 with size 2", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 1, 2)
++		require.Len(t, r.Migrations, 2)
++		require.Equal(t, "1", r.Migrations[0].Version)
++		require.Equal(t, "2", r.Migrations[1].Version)
++		require.Equal(t, 1, r.Page)
++		require.Equal(t, 2, r.PageSize)
++		require.Equal(t, 3, r.TotalPages)
++	})
++
++	t.Run("page 2 with size 2", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 2, 2)
++		require.Len(t, r.Migrations, 2)
++		require.Equal(t, "3", r.Migrations[0].Version)
++		require.Equal(t, "4", r.Migrations[1].Version)
++		require.Equal(t, 2, r.Page)
++		require.Equal(t, 3, r.TotalPages)
++	})
++
++	t.Run("last page with remaining items", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 3, 2)
++		require.Len(t, r.Migrations, 1)
++		require.Equal(t, "5", r.Migrations[0].Version)
++		require.Equal(t, 3, r.Page)
++		require.Equal(t, 3, r.TotalPages)
++	})
++
++	t.Run("page exceeds total pages is clamped", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 10, 2)
++		require.Len(t, r.Migrations, 1)
++		require.Equal(t, "5", r.Migrations[0].Version)
++		require.Equal(t, 3, r.Page) // clamped to last page
++	})
++
++	t.Run("page size larger than total", func(t *testing.T) {
++		r := cloneDashboardResult(result)
++		dbmate.PaginateDashboardResult(r, 1, 100)
++		require.Len(t, r.Migrations, 5)
++		require.Equal(t, 1, r.Page)
++		require.Equal(t, 1, r.TotalPages)
++	})
++
++	t.Run("empty migrations", func(t *testing.T) {
++		r := &dbmate.DashboardResult{
++			TotalApplied: 0,
++			TotalPending: 0,
++			Total:        0,
++			Migrations:   nil,
++		}
++		dbmate.PaginateDashboardResult(r, 1, 10)
++		require.Len(t, r.Migrations, 0)
++		require.Equal(t, 1, r.Page)
++		require.Equal(t, 1, r.TotalPages)
++	})
++}
++
++func TestPrintDashboardTablePagination(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 2,
++		TotalPending: 1,
++		Total:        3,
++		Page:         1,
++		PageSize:     2,
++		TotalPages:   2,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "20230101000000", FileName: "20230101000000_create_users.sql", Applied: true, Status: "applied"},
++			{Version: "20230201000000", FileName: "20230201000000_create_posts.sql", Applied: true, Status: "applied"},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++	require.Contains(t, output, "Applied: 2")
++	require.Contains(t, output, "Pending: 1")
++	require.Contains(t, output, "Total: 3")
++	require.Contains(t, output, "Page: 1/2")
++	require.Contains(t, output, "Page Size: 2")
++}
++
++func TestPrintDashboardTableNoPagination(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 0,
++		Total:        1,
++		Page:         0,
++		PageSize:     0,
++		TotalPages:   0,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "20230101000000", FileName: "20230101000000_create_users.sql", Applied: true, Status: "applied"},
++		},
++	}
++
++	var buf bytes.Buffer
++	dbmate.PrintDashboardTable(&buf, result, false, false)
++
++	output := buf.String()
++	require.NotContains(t, output, "Page:")
++	require.NotContains(t, output, "Page Size:")
++}
++
++func TestPrintDashboardTableColor(t *testing.T) {
++	result := &dbmate.DashboardResult{
++		TotalApplied: 1,
++		TotalPending: 1,
++		Total:        2,
++		Migrations: []dbmate.MigrationStatus{
++			{Version: "20230101000000", FileName: "20230101000000_create_users.sql", Applied: true, Status: "applied"},
++			{Version: "20230201000000", FileName: "20230201000000_add_email.sql", Applied: false, Status: "pending"},
++		},
++	}
++
++	t.Run("with color", func(t *testing.T) {
++		var buf bytes.Buffer
++		dbmate.PrintDashboardTable(&buf, result, false, true)
++		output := buf.String()
++		// ANSI escape codes should be present
++		require.Contains(t, output, "\033[")
++		require.Contains(t, output, "\033[32m") // green for applied
++		require.Contains(t, output, "\033[33m") // yellow for pending
++		require.Contains(t, output, "\033[0m")  // reset
++	})
++
++	t.Run("without color", func(t *testing.T) {
++		var buf bytes.Buffer
++		dbmate.PrintDashboardTable(&buf, result, false, false)
++		output := buf.String()
++		require.NotContains(t, output, "\033[")
++	})
++
++	t.Run("color summary", func(t *testing.T) {
++		var buf bytes.Buffer
++		dbmate.PrintDashboardTable(&buf, result, false, true)
++		output := buf.String()
++		require.Contains(t, output, "\033[32mApplied:")
++		require.Contains(t, output, "\033[33mPending:")
++		require.Contains(t, output, "\033[36mTotal:")
++	})
++}
+diff --git a/case_collection_issue_output/init/pkg/dbmate/db.go b/case_collection_issue_output/final/pkg/dbmate/db.go
+index 69cc419..669380e 100644
+--- a/case_collection_issue_output/init/pkg/dbmate/db.go
++++ b/case_collection_issue_output/final/pkg/dbmate/db.go
+@@ -2,6 +2,7 @@ package dbmate
+ 
+ import (
+ 	"database/sql"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -12,6 +13,7 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"sort"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/amacneil/dbmate/v2/pkg/dbutil"
+warning: in the working copy of 'case_collection_issue_output/final/testdata/db/migrations/20210501000000_add_comments.
+sql', LF will be replaced by CRLF the next time Git touches it
+@@ -72,6 +74,27 @@ type StatusResult struct {
+ 	Applied  bool
+ }
+ 
++// MigrationStatus represents a single migration's status for dashboard output
++type MigrationStatus struct {
++	Version  string `json:"version"`
++	FileName string `json:"fileName"`
++	Applied  bool   `json:"applied"`
++	Status   string `json:"status"`
++	Modified string `json:"modified,omitempty"`
++}
++
++// DashboardResult represents the full status dashboard output
++type DashboardResult struct {
++	TotalApplied int              `json:"totalApplied"`
++	TotalPending int              `json:"totalPending"`
++	Total        int              `json:"total"`
++	Migrations   []MigrationStatus `json:"migrations"`
++	// Pagination fields
++	Page       int `json:"page"`
++	PageSize   int `json:"pageSize"`
++	TotalPages int `json:"totalPages"`
++}
++
+ // New initializes a new dbmate database
+ func New(databaseURL *url.URL) *DB {
+ 	return &DB{
+@@ -640,3 +663,301 @@ func (db *DB) Status(quiet bool) (int, error) {
+ 
+ 	return totalPending, nil
+ }
++
++// StatusDashboard returns a DashboardResult with migration status details
++func (db *DB) StatusDashboard() (*DashboardResult, error) {
++	results, err := db.FindMigrations()
++	if err != nil {
++		return nil, err
++	}
++
++	dashboard := &DashboardResult{
++		Total: len(results),
++	}
++
++	for _, m := range results {
++		status := "pending"
++		if m.Applied {
++			status = "applied"
++			dashboard.TotalApplied++
++		}
++
++		var modified string
++		if m.FS == nil {
++			if info, err := os.Stat(m.FilePath); err == nil {
++				modified = info.ModTime().UTC().Format(time.RFC3339)
++			}
++		}
++
++		dashboard.Migrations = append(dashboard.Migrations, MigrationStatus{
++			Version:  m.Version,
++			FileName: m.FileName,
++			Applied:  m.Applied,
++			Status:   status,
++			Modified: modified,
++		})
++	}
++
++	dashboard.TotalPending = dashboard.Total - dashboard.TotalApplied
++
++	return dashboard, nil
++}
++
++// FilterDashboardResult filters migrations by status ("applied" or "pending").
++// If filter is empty, no filtering is applied.
++// TotalApplied and TotalPending are recalculated after filtering.
++func FilterDashboardResult(result *DashboardResult, filter string) {
++	if filter == "" {
++		return
++	}
++
++	filtered := make([]MigrationStatus, 0, len(result.Migrations))
++	for _, m := range result.Migrations {
++		if filter == "applied" && m.Applied {
++			filtered = append(filtered, m)
++		} else if filter == "pending" && !m.Applied {
++			filtered = append(filtered, m)
++		}
++	}
++
++	result.Migrations = filtered
++	result.TotalApplied = 0
++	result.TotalPending = 0
++	for _, m := range result.Migrations {
++		if m.Applied {
++			result.TotalApplied++
++		} else {
++			result.TotalPending++
++		}
++	}
++	result.Total = len(result.Migrations)
++}
++
++// LimitDashboardResult limits the number of migrations shown.
++// If limit is <= 0, no limit is applied.
++func LimitDashboardResult(result *DashboardResult, limit int) {
++	if limit <= 0 {
++		return
++	}
++	if limit >= len(result.Migrations) {
++		return
++	}
++	result.Migrations = result.Migrations[:limit]
++}
++
++// PaginateDashboardResult applies pagination to the dashboard result.
++// page is 1-based. pageSize must be > 0.
++// If page or pageSize are zero, no pagination is applied (all migrations are shown).
++func PaginateDashboardResult(result *DashboardResult, page, pageSize int) {
++	if page <= 0 || pageSize <= 0 {
++		result.Page = 0
++		result.PageSize = 0
++		result.TotalPages = 0
++		return
++	}
++
++	total := len(result.Migrations)
++	totalPages := (total + pageSize - 1) / pageSize
++	if totalPages == 0 {
++		totalPages = 1
++	}
++
++	// Clamp page to valid range
++	if page > totalPages {
++		page = totalPages
++	}
++
++	start := (page - 1) * pageSize
++	end := start + pageSize
++	if end > total {
++		end = total
++	}
++
++	result.Migrations = result.Migrations[start:end]
++	result.Page = page
++	result.PageSize = pageSize
++	result.TotalPages = totalPages
++}
++
++// SortDashboardResult sorts migrations in the DashboardResult by the specified field.
++// Supported sort fields: "version" (default), "status", "name", "modified".
++func SortDashboardResult(result *DashboardResult, sortBy string) {
++	if sortBy == "" {
++		sortBy = "version"
++	}
++
++	sort.SliceStable(result.Migrations, func(i, j int) bool {
++		a, b := result.Migrations[i], result.Migrations[j]
++		switch sortBy {
++		case "status":
++			// applied first, then pending; within same status, sort by version
++			if a.Applied != b.Applied {
++				return a.Applied
++			}
++			return a.Version < b.Version
++		case "name":
++			return a.FileName < b.FileName
++		case "modified":
++			// most recent first, then by version for ties
++			if a.Modified != b.Modified {
++				return a.Modified > b.Modified
++			}
++			return a.Version < b.Version
++		default: // "version"
++			return a.Version < b.Version
++		}
++	})
++}
++
++// ANSI color codes
++const (
++	colorReset  = "\033[0m"
++	colorRed    = "\033[31m"
++	colorGreen  = "\033[32m"
++	colorYellow = "\033[33m"
++	colorCyan   = "\033[36m"
++	colorBold   = "\033[1m"
++)
++
++// PrintDashboardTable prints the dashboard result in table format
++func PrintDashboardTable(w io.Writer, result *DashboardResult, noHeader bool, useColor bool) {
++	if len(result.Migrations) == 0 {
++		fmt.Fprintln(w, "No migrations found.")
++		return
++	}
++
++	// Color helpers
++	green := func(s string) string {
++		if useColor {
++			return colorGreen + s + colorReset
++		}
++		return s
++	}
++	yellow := func(s string) string {
++		if useColor {
++			return colorYellow + s + colorReset
++		}
++		return s
++	}
++	bold := func(s string) string {
++		if useColor {
++			return colorBold + s + colorReset
++		}
++		return s
++	}
++	cyan := func(s string) string {
++		if useColor {
++			return colorCyan + s + colorReset
++		}
++		return s
++	}
++
++	// Column headers
++	headers := []string{"Status", "Version", "Migration Name", "Modified"}
++	colWidths := make([]int, len(headers))
++	for i, h := range headers {
++		colWidths[i] = len(h)
++	}
++
++	// Calculate column widths (use plain text widths, without ANSI codes)
++	plainStatus := make([]string, len(result.Migrations))
++	for i, m := range result.Migrations {
++		if m.Applied {
++			plainStatus[i] = "[X]"
++		} else {
++			plainStatus[i] = "[ ]"
++		}
++	}
++
++	rows := make([][]string, len(result.Migrations))
++	for i, m := range result.Migrations {
++		rows[i] = []string{plainStatus[i], m.Version, m.FileName, m.Modified}
++		for j, cell := range rows[i] {
++			if len(cell) > colWidths[j] {
++				colWidths[j] = len(cell)
++			}
++		}
++	}
++
++	// Print separator line
++	printSeparator := func() {
++		fmt.Fprint(w, "+")
++		for _, cw := range colWidths {
++			fmt.Fprintf(w, "%s+", strings.Repeat("-", cw+2))
++		}
++		fmt.Fprintln(w)
++	}
++
++	// Print row with padding
++	printRow := func(cells []string) {
++		fmt.Fprint(w, "|")
++		for j, cell := range cells {
++			fmt.Fprintf(w, " %-*s |", colWidths[j], cell)
++		}
++		fmt.Fprintln(w)
++	}
++
++	// Print colored data row
++	printDataRow := func(idx int) {
++		m := result.Migrations[idx]
++		statusIcon := plainStatus[idx]
++		if useColor {
++			if m.Applied {
++				statusIcon = green(statusIcon)
++			} else {
++				statusIcon = yellow(statusIcon)
++			}
++		}
++		fmt.Fprint(w, "|")
++		fmt.Fprintf(w, " %-*s |", colWidths[0], statusIcon)
++		fmt.Fprintf(w, " %-*s |", colWidths[1], m.Version)
++		fmt.Fprintf(w, " %-*s |", colWidths[2], m.FileName)
++		fmt.Fprintf(w, " %-*s |", colWidths[3], m.Modified)
++		fmt.Fprintln(w)
++	}
++
++	// Print table
++	if !noHeader {
++		printSeparator()
++		if useColor {
++			printRow([]string{bold(headers[0]), bold(headers[1]), bold(headers[2]), bold(headers[3])})
++		} else {
++			printRow(headers)
++		}
++	}
++	printSeparator()
++
++	// Print data rows
++	for i := range rows {
++		printDataRow(i)
++	}
++
++	printSeparator()
++
++	// Print summary
++	fmt.Fprintln(w)
++	appliedLabel := fmt.Sprintf("Applied: %d", result.TotalApplied)
++	pendingLabel := fmt.Sprintf("Pending: %d", result.TotalPending)
++	totalLabel := fmt.Sprintf("Total: %d", result.Total)
++	if useColor {
++		appliedLabel = green(appliedLabel)
++		pendingLabel = yellow(pendingLabel)
++		totalLabel = cyan(totalLabel)
++	}
++	fmt.Fprintf(w, "%s  |  %s  |  %s\n", appliedLabel, pendingLabel, totalLabel)
++
++	// Print pagination info if pagination is active
++	if result.Page > 0 {
++		fmt.Fprintf(w, "Page: %d/%d  |  Page Size: %d\n",
++			result.Page, result.TotalPages, result.PageSize)
++	}
++}
++
++// PrintDashboardJSON prints the dashboard result in JSON format
++func PrintDashboardJSON(w io.Writer, result *DashboardResult, indent string) error {
++	encoder := json.NewEncoder(w)
++	if indent != "" {
++		encoder.SetIndent("", indent)
++	}
++	return encoder.Encode(result)
++}
+diff --git a/case_collection_issue_output/final/testdata/db/migrations/20210501000000_add_comments.sql b/case_collection_issue_output/final/testdata/db/migrations/20210501000000_add_comments.sql
+new file mode 100644
+warning: in the working copy of 'case_collection_issue_output/final/testdata/db/migrations/20220815000000_add_tags.sql'
+, LF will be replaced by CRLF the next time Git touches it
+index 0000000..a08d34b
+--- /dev/null
++++ b/case_collection_issue_output/final/testdata/db/migrations/20210501000000_add_comments.sql
+@@ -0,0 +1,11 @@
++-- migrate:up
++create table comments (
++  id integer primary key,
++  post_id integer,
++  author varchar(255),
++  content text,
+warning: in the working copy of 'case_collection_issue_output/final/testdata/db/migrations/20231201000000_add_user_emai
+l.sql', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'case_collection_issue_output/final/testdata/db/migrations/20240601000000_add_audit_log
+.sql', LF will be replaced by CRLF the next time Git touches it
++  created_at datetime default current_timestamp
++);
++
++-- migrate:down
++drop table comments;
+diff --git a/case_collection_issue_output/final/testdata/db/migrations/20220815000000_add_tags.sql b/case_collection_issue_output/final/testdata/db/migrations/20220815000000_add_tags.sql
+new file mode 100644
+index 0000000..8a3fbf7
+--- /dev/null
++++ b/case_collection_issue_output/final/testdata/db/migrations/20220815000000_add_tags.sql
+@@ -0,0 +1,14 @@
++-- migrate:up
++create table tags (
++  id integer primary key,
++  name varchar(100) unique not null
++);
++create table post_tags (
++  post_id integer,
++  tag_id integer,
++  primary key (post_id, tag_id)
++);
++
++-- migrate:down
++drop table post_tags;
++drop table tags;
+diff --git a/case_collection_issue_output/final/testdata/db/migrations/20231201000000_add_user_email.sql b/case_collection_issue_output/final/testdata/db/migrations/20231201000000_add_user_email.sql
+new file mode 100644
+index 0000000..e78def0
+--- /dev/null
++++ b/case_collection_issue_output/final/testdata/db/migrations/20231201000000_add_user_email.sql
+@@ -0,0 +1,4 @@
++-- migrate:up
++alter table users add column email varchar(255);
++
++-- migrate:down
+diff --git a/case_collection_issue_output/final/testdata/db/migrations/20240601000000_add_audit_log.sql b/case_collection_issue_output/final/testdata/db/migrations/20240601000000_add_audit_log.sql
+new file mode 100644
+index 0000000..0cd617c
+--- /dev/null
++++ b/case_collection_issue_output/final/testdata/db/migrations/20240601000000_add_audit_log.sql
+@@ -0,0 +1,10 @@
++-- migrate:up
++create table audit_log (
++  id integer primary key,
++  table_name varchar(100),
++  action varchar(20),
++  performed_at datetime default current_timestamp
++);
++
++-- migrate:down
++drop table audit_log;

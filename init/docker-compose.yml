@@ -1,0 +1,75 @@
+services:
+  dev:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/src
+    depends_on:
+      - mysql
+      - postgres
+      - clickhouse
+      - clickhouse-cluster-01
+      - clickhouse-cluster-02
+      - bigquery
+      - spanner-emulator
+    environment:
+      CLICKHOUSE_TEST_URL: clickhouse://clickhouse:9000/dbmate_test
+      CLICKHOUSE_CLUSTER_01_TEST_URL: clickhouse://ch-cluster-01:9000/dbmate_test
+      CLICKHOUSE_CLUSTER_02_TEST_URL: clickhouse://ch-cluster-02:9000/dbmate_test
+      MYSQL_TEST_URL: mysql://root:root@mysql/dbmate_test
+      POSTGRES_TEST_URL: postgres://postgres:postgres@postgres/dbmate_test?sslmode=disable
+      BIGQUERY_TEST_URL: bigquery://test/us-east5/dbmate_test?disable_auth=true&endpoint=http%3A%2F%2Fbigquery%3A9050
+      SPANNER_POSTGRES_TEST_URL: spanner-postgres://spanner-emulator/dbmate_test?sslmode=disable
+
+  dbmate:
+    build:
+      context: .
+      target: release
+    image: dbmate_release
+
+  mysql:
+    image: mysql/mysql-server:8.0
+    environment:
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_ROOT_PASSWORD: root
+
+  postgres:
+    image: postgres:10
+    environment:
+      POSTGRES_PASSWORD: postgres
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:22.8
+
+  zookeeper:
+    image: zookeeper:3.8
+    hostname: zookeeper
+
+  clickhouse-cluster-01:
+    image: clickhouse/clickhouse-server:22.8
+    hostname: ch-cluster-01
+    environment:
+      - CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
+    depends_on:
+      - zookeeper
+    volumes:
+      - ./pkg/driver/clickhouse/testdata/cluster_config/ch-cluster-01:/etc/clickhouse-server
+
+  clickhouse-cluster-02:
+    image: clickhouse/clickhouse-server:22.8
+    hostname: ch-cluster-02
+    environment:
+      - CLICKHOUSE_CONFIG=/etc/clickhouse-server/config.xml
+    depends_on:
+      - zookeeper
+    volumes:
+      - ./pkg/driver/clickhouse/testdata/cluster_config/ch-cluster-02:/etc/clickhouse-server
+
+  bigquery:
+    image: ghcr.io/goccy/bigquery-emulator:0.4.4
+    command: |
+      --project=test --dataset=dbmate_test
+
+  spanner-emulator:
+    image: gcr.io/cloud-spanner-pg-adapter/pgadapter-emulator:v0.48.3

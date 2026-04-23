@@ -1,0 +1,7 @@
+name: dbmate-status
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - go=1.22
+  - pip

@@ -1,0 +1,28 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - misspell
+    - nakedret
+    - revive
+    - rowserrcheck
+    - unconvert
+    - unparam
+    - usetesting
+    - whitespace
+  settings:
+    misspell:
+      locale: US
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/amacneil/dbmate

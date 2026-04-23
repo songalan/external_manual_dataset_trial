@@ -1,0 +1,28 @@
+{
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.12.0",
+  "scripts": {
+    "clean": "rimraf dist packages/dbmate/dist",
+    "lint": "eslint --report-unused-disable-directives --fix .",
+    "lint:ci": "eslint --report-unused-disable-directives .",
+    "test": "mkdir -p dist/dbmate/node_modules && ln -sfn ../../@dbmate dist/dbmate/node_modules/@dbmate && node --input-type=module -e \"const { resolveBinary } = await import('./dist/dbmate/dist/index.js'); const bin = resolveBinary(); console.log('resolved binary:', bin);\"",
+    "generate": "tsx generate.ts",
+    "publish": "tsx publish.ts"
+  },
+  "devDependencies": {
+    "@actions/exec": "3.0.0",
+    "@foxglove/eslint-plugin": "2.1.0",
+    "@foxglove/tsconfig": "3.2.0",
+    "@types/node": "25.5.0",
+    "eslint": "9.39.4",
+    "handlebars": "4.7.9",
+    "npm-check-updates": "19.6.5",
+    "prettier": "3.8.1",
+    "rimraf": "6.1.3",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.57.2",
+    "yaml": "2.8.3"
+  }
+}
